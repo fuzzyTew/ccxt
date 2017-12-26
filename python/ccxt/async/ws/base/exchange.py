@@ -13,7 +13,7 @@ import aiohttp
 import hashlib
 import sys
 import collections
-import ujson
+import json
 from copy import deepcopy
 import time
 import datetime

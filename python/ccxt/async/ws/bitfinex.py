@@ -5,7 +5,7 @@ import aiohttp
 import hashlib
 import sys
 import collections
-import ujson
+import json
 from copy import deepcopy
 import time
 import datetime
@@ -128,7 +128,7 @@ class bitfinex (Exchange):
 
     async def event_handler(self, response):
         """ Handles the incoming responses"""
-        data = ujson.loads(response.data)
+        data = json.loads(response.data)
         if isinstance(data, dict):
             if data['event'] == 'subscribed':
                 print('Subscribed to channel: {0}, for pair: {1}, on channel ID: {2}'.format(data['channel'], data['pair'], data['chanId']))
