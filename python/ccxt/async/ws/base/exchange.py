@@ -4,18 +4,19 @@
 
 # -----------------------------------------------------------------------------
 
-__version__ = '1.10.63'
+__version__ = '1.10.488'
 
 # -----------------------------------------------------------------------------
 
 import asyncio
 import aiohttp
 import hashlib
-import sys
+# import sys
 import collections
 import json
 from copy import deepcopy
 import time
+import uuid
 import datetime
 
 # -----------------------------------------------------------------------------
@@ -45,7 +46,12 @@ class Exchange(object):
     asyncio_loop = None
     aiohttp_session = None
     aiohttp_proxy = None
-    userAgent = False
+    session = None  # Session ()
+    userAgent = None
+    userAgents = {
+        'chrome': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/62.0.3202.94 Safari/537.36',
+        'chrome39': 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/39.0.2171.71 Safari/537.36',
+    }
     verbose = False
     markets = None
     symbols = None
@@ -56,11 +62,15 @@ class Exchange(object):
     currencies = None
     tickers = None
     api = None
+    parseJsonResponse = True
+    headers = {}
     balance = {}
     orderbooks = {}
     orders = {}
     trades = {}
+    currencies = {}
     proxy = ''
+    proxies = None
     apiKey = ''
     secret = ''
     password = ''
@@ -93,12 +103,25 @@ class Exchange(object):
     hasCreateOrder = hasPrivateAPI
     hasCancelOrder = hasPrivateAPI
 
+    requiredCredentials = {
+        'apiKey': True,
+        'secret': True,
+        'uid': False,
+        'login': False,
+        'password': False,
+    }
+
     # API method metainfo
     has = {
+        'cancelOrder': hasPrivateAPI,
+        'createDepositAddress': False,
+        'createOrder': hasPrivateAPI,
         'deposit': False,
         'fetchBalance': True,
         'fetchClosedOrders': False,
         'fetchCurrencies': False,
+        'fetchDepositAddress': False,
+        'fetchMarkets': True,
         'fetchMyTrades': False,
         'fetchOHLCV': False,
         'fetchOpenOrders': False,
@@ -124,15 +147,18 @@ class Exchange(object):
 
     def __init__(self, config={}):
 
-        version = '.'.join(map(str, sys.version_info[:3]))
-        self.userAgent = {
-            'User-Agent': 'ccxt/' + __version__ + ' (+https://github.com/ccxt-dev/ccxt) Python/' + version
-        }
+        # version = '.'.join(map(str, sys.version_info[:3]))
+        # self.userAgent = {
+        #     'User-Agent': 'ccxt/' + __version__ + ' (+https://github.com/ccxt/ccxt) Python/' + version
+        # }
 
         settings = self.deep_extend(self.describe(), config)
 
         for key in settings:
-            setattr(self, key, settings[key])
+            if hasattr(self, key) and isinstance(getattr(self, key), dict):
+                setattr(self, key, self.deep_extend(getattr(self, key), settings[key]))
+            else:
+                setattr(self, key, settings[key])
 
         if self.markets:
             self.set_markets(self.markets)
@@ -158,7 +184,6 @@ class Exchange(object):
                     await ws.send_json(request_packet)
                     print('sending packet {0}'.format(request_packet))
                     self.queue_request.task_done()
-
                 response = await ws.receive()
                 await self.event_handler(response)
 
@@ -235,24 +260,30 @@ class Exchange(object):
 
     @staticmethod
     def safe_float(dictionary, key, default_value=None):
-        return float(dictionary[key]) if (key in dictionary) and dictionary[key] else default_value
+        return float(dictionary[key]) if key is not None and (key in dictionary) and dictionary[key] else default_value
 
     @staticmethod
     def safe_string(dictionary, key, default_value=None):
-        return str(dictionary[key]) if (key in dictionary) and dictionary[key] else default_value
+        return str(dictionary[key]) if key is not None and (key in dictionary) and dictionary[key] else default_value
 
     @staticmethod
     def safe_integer(dictionary, key, default_value=None):
-        return int(dictionary[key]) if (key in dictionary) and dictionary[key] else default_value
+        return int(dictionary[key]) if key is not None and (key in dictionary) and dictionary[key] else default_value
 
     @staticmethod
     def safe_value(dictionary, key, default_value=None):
-        return dictionary[key] if (key in dictionary) and dictionary[key] else default_value
+        return dictionary[key] if key is not None and (key in dictionary) and dictionary[key] else default_value
 
     @staticmethod
     def truncate(num, precision=0):
-        decimal_precision = math.pow(10, precision)
-        return math.trunc(num * decimal_precision) / decimal_precision
+        if precision > 0:
+            decimal_precision = math.pow(10, precision)
+            return math.trunc(num * decimal_precision) / decimal_precision
+        return num
+
+    @staticmethod
+    def uuid():
+        return str(uuid.uuid4())
 
     @staticmethod
     def capitalize(string):  # first character only, rest characters unchanged
@@ -335,6 +366,10 @@ class Exchange(object):
         return sorted(array, key=lambda k: k[key], reverse=descending)
 
     @staticmethod
+    def array_concat(a, b):
+        return a + b
+
+    @staticmethod
     def extract_params(string):
         return re.findall(r'{([a-zA-Z0-9_]+?)}', string)
 
@@ -403,7 +438,8 @@ class Exchange(object):
     def aggregate(bidasks):
         ordered = Exchange.ordered({})
         for [price, volume] in bidasks:
-            ordered[price] = (ordered[price] if price in ordered else 0) + volume
+            if volume > 0:
+                ordered[price] = (ordered[price] if price in ordered else 0) + volume
         result = []
         items = list(ordered.items())
         for price, volume in items:
@@ -543,6 +579,12 @@ class Exchange(object):
     def nonce(self):
         return Exchange.seconds()
 
+    def check_required_credentials(self):
+        keys = list(self.requiredCredentials.keys())
+        for key in keys:
+            if self.requiredCredentials[key] and not getattr(self, key):
+                raise AuthenticationError(self.id + ' requires `' + key + '`')
+
     def account(self):
         return {
             'free': 0.0,
@@ -581,7 +623,7 @@ class Exchange(object):
     def fee_to_precision(self, symbol, fee):
         return ('{:.' + str(self.markets[symbol]['precision']['price']) + 'f}').format(float(fee))
 
-    def set_markets(self, markets):
+    def set_markets(self, markets, currencies=None):
         values = list(markets.values()) if type(markets) is dict else markets
         for i in range(0, len(values)):
             values[i] = self.extend(
@@ -594,9 +636,19 @@ class Exchange(object):
         self.marketsById = self.markets_by_id
         self.symbols = sorted(list(self.markets.keys()))
         self.ids = sorted(list(self.markets_by_id.keys()))
-        base = self.pluck([market for market in values if 'base' in market], 'base')
-        quote = self.pluck([market for market in values if 'quote' in market], 'quote')
-        self.currencies = sorted(self.unique(base + quote))
+        if currencies:
+            self.currencies = self.deep_extend(currencies, self.currencies)
+        else:
+            base_currencies = [{
+                'id': market['baseId'] if 'baseId' in market else market['base'],
+                'code': market['base'],
+            } for market in values if 'base' in market]
+            quote_currencies = [{
+                'id': market['quoteId'] if 'quoteId' in market else market['quote'],
+                'code': market['quote'],
+            } for market in values if 'quote' in market]
+            currencies = self.sort_by(base_currencies + quote_currencies, 'code')
+            self.currencies = self.deep_extend(self.index_by(currencies, 'code'), self.currencies)
         return self.markets
 
     def load_markets(self, reload=False):
@@ -606,7 +658,10 @@ class Exchange(object):
                     return self.set_markets(self.markets)
                 return self.markets
         markets = self.fetch_markets()
-        return self.set_markets(markets)
+        currencies = None
+        if self.has['fetchCurrencies']:
+            currencies = self.fetch_currencies()
+        return self.set_markets(markets, currencies)
 
     def fetch_markets(self):
         return self.markets
@@ -637,14 +692,37 @@ class Exchange(object):
         return ohlcv
 
     def parse_ohlcvs(self, ohlcvs, market=None, timeframe='1m', since=None, limit=None):
-        array = self.to_array(ohlcvs)
-        return [self.parse_ohlcv(ohlcv, market, timeframe, since, limit) for ohlcv in array]
+        ohlcvs = self.to_array(ohlcvs)
+        num_ohlcvs = len(ohlcvs)
+        result = []
+        i = 0
+        while i < num_ohlcvs:
+            if limit and (len(result) >= limit):
+                break
+            ohlcv = self.parse_ohlcv(ohlcvs[i], market, timeframe, since, limit)
+            i = i + 1
+            if since and (ohlcv[0] < since):
+                continue
+            result.append(ohlcv)
+        return result
 
     def parse_bid_ask(self, bidask, price_key=0, amount_key=0):
         return [float(bidask[price_key]), float(bidask[amount_key])]
 
     def parse_bids_asks(self, bidasks, price_key=0, amount_key=1):
-        return [self.parse_bid_ask(bidask, price_key, amount_key) for bidask in bidasks]
+        result = []
+        if len(bidasks):
+            if type(bidasks[0]) is list:
+                for bidask in bidasks:
+                    if bidask[price_key] and bidask[amount_key]:
+                        result.append(self.parse_bid_ask(bidask, price_key, amount_key))
+            elif type(bidasks[0]) is dict:
+                for bidask in bidasks:
+                    if (price_key in bidask) and (amount_key in bidask) and (bidask[price_key] and bidask[amount_key]):
+                        result.append(self.parse_bid_ask(bidask, price_key, amount_key))
+            else:
+                raise ExchangeError(self.id + ' unrecognized bidask format: ' + str(bidasks[0]))
+        return result
 
     def fetch_l2_order_book(self, symbol, params={}):
         orderbook = self.fetch_order_book(symbol, params)
@@ -656,8 +734,8 @@ class Exchange(object):
     def parse_order_book(self, orderbook, timestamp=None, bids_key='bids', asks_key='asks', price_key=0, amount_key=1):
         timestamp = timestamp or self.milliseconds()
         return {
-            'bids': self.parse_bids_asks(orderbook[bids_key], price_key, amount_key) if bids_key in orderbook else [],
-            'asks': self.parse_bids_asks(orderbook[asks_key], price_key, amount_key) if asks_key in orderbook else [],
+            'bids': self.parse_bids_asks(orderbook[bids_key], price_key, amount_key) if (bids_key in orderbook) and isinstance(orderbook[bids_key], list) else [],
+            'asks': self.parse_bids_asks(orderbook[asks_key], price_key, amount_key) if (asks_key in orderbook) and isinstance(orderbook[asks_key], list) else [],
             'timestamp': timestamp,
             'datetime': self.iso8601(timestamp),
         }
@@ -686,12 +764,22 @@ class Exchange(object):
     def fetch_ohlcv(self, symbol, timeframe='1m', since=None, limit=None, params={}):
         raise NotSupported(self.id + ' API does not allow to fetch OHLCV series for now')
 
-    def parse_trades(self, trades, market=None):
+    def parse_trades(self, trades, market=None, since=None, limit=None):
         array = self.to_array(trades)
-        return [self.parse_trade(trade, market) for trade in array]
+        array = [self.parse_trade(trade, market) for trade in array]
+        return self.filter_by_since_limit(array, since, limit)
 
-    def parse_orders(self, orders, market=None):
-        return [self.parse_order(order, market) for order in orders]
+    def parse_orders(self, orders, market=None, since=None, limit=None):
+        array = self.to_array(orders)
+        array = [self.parse_order(order, market) for order in array]
+        return self.filter_by_since_limit(array, since, limit)
+
+    def filter_by_since_limit(self, array, since=None, limit=None):
+        if since:
+            array = [entry for entry in array if entry['timestamp'] > since]
+        if limit:
+            array = array[0:limit]
+        return array
 
     def filter_orders_by_symbol(self, orders, symbol=None):
         if symbol:
@@ -700,6 +788,13 @@ class Exchange(object):
                 return grouped[symbol]
             return []
         return orders
+
+    def currency(self, code):
+        if not self.currencies:
+            raise ExchangeError(self.id + ' currencies not loaded')
+        if isinstance(code, basestring) and (code in self.currencies):
+            return self.currencies[code]
+        raise ExchangeError(self.id + ' does not have currency code ' + str(code))
 
     def market(self, symbol):
         if not self.markets:
@@ -715,20 +810,15 @@ class Exchange(object):
         market = self.market(symbol)
         return market['id'] if type(market) is dict else symbol
 
-    def calculate_fee_rate(self, symbol, type, side, amount, price, fee='taker', params={}):
-        return {
-            'base': 0.0,
-            'quote': self.markets[symbol][fee],
-        }
-
-    def calculate_fee(self, symbol, type, side, amount, price, fee='taker', params={}):
-        rate = self.calculateFeeRate(symbol, type, side, amount, price, fee, params)
+    def calculate_fee(self, symbol, type, side, amount, price, taker_or_maker='taker', params={}):
+        market = self.markets[symbol]
+        rate = market[taker_or_maker]
+        cost = float(self.cost_to_precision(symbol, amount * price))
         return {
             'rate': rate,
-            'cost': {
-                'base': amount * rate['base'],
-                'quote': amount * price * rate['quote'],
-            },
+            'type': taker_or_maker,
+            'currency': market['quote'],
+            'cost': float(self.fee_to_precision(symbol, rate * cost)),
         }
 
     def edit_limit_buy_order(self, id, symbol, *args):
